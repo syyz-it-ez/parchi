@@ -259,6 +259,8 @@ import { SidePanelUI } from './panel-ui.js';
     this.clearErrorBanner();
     this.updateActivityState();
     this.activeToolName = message.tool || null;
+    this.lastRunId = message.runId || this.lastRunId;
+    this.recordToolExecutionStart?.(message);
     this.displayToolExecution(message.tool, message.args, null, message.id);
     return;
   }
@@ -266,6 +268,8 @@ import { SidePanelUI } from './panel-ui.js';
     this.pendingToolCount = Math.max(0, this.pendingToolCount - 1);
     this.updateActivityState();
     this.activeToolName = null;
+    this.lastRunId = message.runId || this.lastRunId;
+    this.recordToolExecutionResult?.(message);
     this.displayToolExecution(message.tool, message.args, message.result, message.id);
     return;
   }

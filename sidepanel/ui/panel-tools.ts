@@ -1,6 +1,91 @@
 import { dedupeThinking } from '../../ai/message-utils.js';
 import { SidePanelUI } from './panel-ui.js';
 
+(SidePanelUI.prototype as any).recordToolExecutionStart = function recordToolExecutionStart(message: any) {
+  if (!message) return;
+  const id = message.id || `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const runId = message.runId || this.lastRunId || `run-${Date.now()}`;
+  const existing = this.qaToolEventIndex.get(id);
+  const args = message.args || {};
+  const startedAt = typeof message.timestamp === 'number' ? message.timestamp : Date.now();
+  if (existing) {
+    existing.status = 'running';
+    existing.startedAt = existing.startedAt || startedAt;
+    existing.args = args;
+    existing.runId = runId;
+    return;
+  }
+
+  const entry = {
+    id,
+    runId,
+    tool: message.tool || 'tool',
+    args,
+    status: 'running',
+    startedAt,
+  };
+
+  this.qaToolEventIndex.set(id, entry);
+  this.qaToolEvents.push(entry);
+
+  // Keep the log bounded to avoid storage bloat.
+  if (this.qaToolEvents.length > 500) {
+    const overflow = this.qaToolEvents.length - 500;
+    const trimmed = this.qaToolEvents.splice(0, overflow);
+    trimmed.forEach((event) => this.qaToolEventIndex.delete(event.id));
+  }
+};
+
+(SidePanelUI.prototype as any).recordToolExecutionResult = function recordToolExecutionResult(message: any) {
+  if (!message) return;
+  const id = message.id || `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const runId = message.runId || this.lastRunId || `run-${Date.now()}`;
+  const args = message.args || {};
+  const endedAt = typeof message.timestamp === 'number' ? message.timestamp : Date.now();
+  const result = message.result;
+  const hasError = Boolean(result && (result.error || result.success === false));
+
+  let entry = this.qaToolEventIndex.get(id);
+  if (!entry) {
+    entry = {
+      id,
+      runId,
+      tool: message.tool || 'tool',
+      args,
+      status: hasError ? 'error' : 'success',
+      startedAt: endedAt,
+    };
+    this.qaToolEvents.push(entry);
+    this.qaToolEventIndex.set(id, entry);
+    if (this.qaToolEvents.length > 500) {
+      const overflow = this.qaToolEvents.length - 500;
+      const trimmed = this.qaToolEvents.splice(0, overflow);
+      trimmed.forEach((event) => this.qaToolEventIndex.delete(event.id));
+    }
+  }
+
+  entry.status = hasError ? 'error' : 'success';
+  entry.endedAt = endedAt;
+  entry.args = args;
+  entry.runId = runId;
+  entry.resultSummary = this.summarizeToolResult?.(result);
+};
+
+(SidePanelUI.prototype as any).summarizeToolResult = function summarizeToolResult(result: any) {
+  if (!result) return '';
+  if (typeof result === 'string') {
+    return this.truncateText(result, 140);
+  }
+  if (typeof result === 'object') {
+    const error = result.error ? String(result.error) : '';
+    if (error) return this.truncateText(`Error: ${error}`, 160);
+    const message = result.message || result.summary || result.text || '';
+    if (message) return this.truncateText(String(message), 160);
+  }
+  const raw = this.safeJsonStringify(result);
+  return this.truncateText(raw, 160);
+};
+
 (SidePanelUI.prototype as any).displayToolExecution = function displayToolExecution(
   toolName: string,
   args: any,

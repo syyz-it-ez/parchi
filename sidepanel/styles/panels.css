@@ -369,8 +369,15 @@
   opacity: 0.5;
 }
 
-.history-delete {
+.history-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   flex-shrink: 0;
+}
+
+.history-action,
+.history-delete {
   width: 24px;
   height: 24px;
   display: flex;
@@ -385,8 +392,18 @@
   cursor: pointer;
 }
 
-.history-item:hover .history-delete {
+.history-item:hover .history-delete,
+.history-item:hover .history-action {
   opacity: 1;
+}
+
+.history-action:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.history-item:hover .history-action:disabled {
+  opacity: 0.35;
 }
 
 .history-delete:hover {

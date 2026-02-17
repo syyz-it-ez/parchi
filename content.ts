@@ -7,6 +7,26 @@ type HighlightEntry = {
   originalOutlineOffset: string;
 };
 
+type FindElementQuery = {
+  text?: string;
+  role?: string;
+  label?: string;
+  selector?: string;
+  exact?: boolean;
+  includeHidden?: boolean;
+  limit?: number;
+};
+
+type FoundElement = {
+  selector: string;
+  text: string;
+  role: string;
+  label: string;
+  tagName: string;
+  visible: boolean;
+  score: number;
+};
+
 class ContentScriptHandler {
   highlightedElements: Set<HighlightEntry>;
 
@@ -60,9 +80,40 @@ class ContentScriptHandler {
           break;
 
         case 'get_visible_text':
-          const text = this.getVisibleText();
+          const text = this.getVisibleText(message.selector, message.maxChars);
           sendResponse({ success: true, text });
           break;
+
+        case 'find_elements':
+          const results = this.findElements(message.query || {});
+          sendResponse({ success: true, results });
+          break;
+
+        case 'click_by_text': {
+          const result = this.clickByText(message.text, {
+            role: message.role,
+            exact: message.exact,
+          });
+          sendResponse(result);
+          break;
+        }
+
+        case 'click_by_role': {
+          const result = this.clickByRole(message.role, {
+            name: message.name,
+            exact: message.exact,
+          });
+          sendResponse(result);
+          break;
+        }
+
+        case 'type_by_label': {
+          const result = this.typeByLabel(message.label, message.text, {
+            exact: message.exact,
+          });
+          sendResponse(result);
+          break;
+        }
 
         default:
           sendResponse({ success: false, error: 'Unknown action' });
@@ -250,9 +301,239 @@ class ContentScriptHandler {
     return element.tagName.toLowerCase();
   }
 
-  getVisibleText() {
+  normalizeText(value: string) {
+    return value.replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  getImplicitRole(element: HTMLElement) {
+    const tag = element.tagName.toLowerCase();
+    if (tag === 'button') return 'button';
+    if (tag === 'a' && (element as HTMLAnchorElement).href) return 'link';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'select') return 'combobox';
+    if (tag === 'input') {
+      const input = element as HTMLInputElement;
+      const type = (input.type || 'text').toLowerCase();
+      if (['button', 'submit', 'reset'].includes(type)) return 'button';
+      if (['checkbox', 'radio'].includes(type)) return type;
+      if (['email', 'text', 'search', 'password', 'tel', 'url', 'number'].includes(type)) return 'textbox';
+    }
+    return '';
+  }
+
+  getAccessibleName(element: HTMLElement) {
+    const ariaLabel = element.getAttribute('aria-label');
+    if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim();
+
+    const labelledBy = element.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      const labelEl = document.getElementById(labelledBy);
+      if (labelEl?.textContent?.trim()) return labelEl.textContent.trim();
+    }
+
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+      const label = this.findLabelForInput(element);
+      if (label?.textContent?.trim()) return label.textContent.trim();
+      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+        const placeholder = element.placeholder;
+        if (placeholder && placeholder.trim()) return placeholder.trim();
+      }
+    }
+
+    if (element.tagName.toLowerCase() === 'img') {
+      const alt = element.getAttribute('alt');
+      if (alt && alt.trim()) return alt.trim();
+    }
+
+    const text = (element as HTMLElement).innerText || element.textContent || '';
+    if (text.trim()) return text.trim();
+
+    const title = element.getAttribute('title');
+    if (title && title.trim()) return title.trim();
+
+    if (element instanceof HTMLInputElement && element.value) return element.value;
+
+    return '';
+  }
+
+  getElementRole(element: HTMLElement) {
+    const explicit = element.getAttribute('role');
+    if (explicit && explicit.trim()) return explicit.trim().toLowerCase();
+    const implicit = this.getImplicitRole(element);
+    return implicit ? implicit.toLowerCase() : '';
+  }
+
+  getElementLabel(element: HTMLElement) {
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) {
+      const label = this.findLabelForInput(element);
+      if (label?.textContent?.trim()) return label.textContent.trim();
+      const ariaLabel = element.getAttribute('aria-label');
+      if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim();
+    }
+    return '';
+  }
+
+  scoreMatch(candidate: string, query: string, exact = false) {
+    if (!query) return 0;
+    if (!candidate) return 0;
+    const normalizedCandidate = this.normalizeText(candidate);
+    const normalizedQuery = this.normalizeText(query);
+    if (!normalizedCandidate || !normalizedQuery) return 0;
+    if (exact) return normalizedCandidate === normalizedQuery ? 2 : 0;
+    if (normalizedCandidate === normalizedQuery) return 2;
+    if (normalizedCandidate.startsWith(normalizedQuery)) return 1.5;
+    if (normalizedCandidate.includes(normalizedQuery)) return 1;
+    return 0;
+  }
+
+  collectCandidates(query: FindElementQuery, options: { clickableOnly?: boolean } = {}) {
+    const selector = query.selector;
+    if (selector) {
+      return Array.from(document.querySelectorAll<HTMLElement>(selector));
+    }
+    if (options.clickableOnly) {
+      return Array.from(
+        document.querySelectorAll<HTMLElement>(
+          'button, a[href], input[type="button"], input[type="submit"], input[type="reset"], [role="button"], [role="link"]',
+        ),
+      );
+    }
+    return Array.from(
+      document.querySelectorAll<HTMLElement>(
+        'button, a[href], input, textarea, select, [role], [aria-label], [aria-labelledby]',
+      ),
+    );
+  }
+
+  findElements(query: FindElementQuery, options: { clickableOnly?: boolean } = {}): FoundElement[] {
+    const candidates = this.collectCandidates(query, options);
+    const includeHidden = query.includeHidden === true;
+    const limit = typeof query.limit === 'number' && query.limit > 0 ? query.limit : 10;
+    const results: FoundElement[] = [];
+
+    candidates.forEach((element) => {
+      const visible = this.isElementVisible(element);
+      if (!includeHidden && !visible) return;
+
+      const text = this.getAccessibleName(element);
+      const role = this.getElementRole(element);
+      const label = this.getElementLabel(element);
+
+      let score = 0;
+      if (query.text) score += this.scoreMatch(text, query.text, query.exact);
+      if (query.label) score += this.scoreMatch(label || text, query.label, query.exact);
+      if (query.role) score += role === query.role.toLowerCase() ? 1.5 : 0;
+
+      if (!query.text && !query.label && !query.role) score = 1;
+      if (score <= 0) return;
+
+      results.push({
+        selector: this.getOptimalSelector(element),
+        text: text || '',
+        role: role || '',
+        label: label || '',
+        tagName: element.tagName,
+        visible,
+        score,
+      });
+    });
+
+    results.sort((a, b) => b.score - a.score);
+    return results.slice(0, limit);
+  }
+
+  clickByText(text: string, options: { role?: string; exact?: boolean } = {}) {
+    if (!text) return { success: false, error: 'Missing text query.' };
+    const results = this.findElements({ text, role: options.role, exact: options.exact }, { clickableOnly: true });
+    const candidate = results[0];
+    if (!candidate) {
+      return { success: false, error: 'No matching element found.', matches: [] };
+    }
+    const element = document.querySelector<HTMLElement>(candidate.selector);
+    if (!element) return { success: false, error: 'Matched element not found in DOM.' };
+
+    element.scrollIntoView({ block: 'center', inline: 'center' });
+    if (!this.isElementVisible(element)) {
+      return { success: false, error: 'Matched element is not visible.', match: candidate };
+    }
+    element.click();
+    return { success: true, selector: candidate.selector, match: candidate, matches: results };
+  }
+
+  clickByRole(role: string, options: { name?: string; exact?: boolean } = {}) {
+    if (!role) return { success: false, error: 'Missing role.' };
+    const normalizedRole = role.toLowerCase();
+    const restrictToClickable = ['button', 'link'].includes(normalizedRole);
+    const results = this.findElements(
+      { role, text: options.name, exact: options.exact },
+      { clickableOnly: restrictToClickable },
+    );
+    const candidate = results[0];
+    if (!candidate) return { success: false, error: 'No matching element found.', matches: [] };
+    const element = document.querySelector<HTMLElement>(candidate.selector);
+    if (!element) return { success: false, error: 'Matched element not found in DOM.' };
+
+    element.scrollIntoView({ block: 'center', inline: 'center' });
+    if (!this.isElementVisible(element)) {
+      return { success: false, error: 'Matched element is not visible.', match: candidate };
+    }
+    element.click();
+    return { success: true, selector: candidate.selector, match: candidate, matches: results };
+  }
+
+  setElementValue(element: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, value: string) {
+    const proto = Object.getPrototypeOf(element);
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor && typeof descriptor.set === 'function') {
+      descriptor.set.call(element, value);
+    } else {
+      element.value = value;
+    }
+  }
+
+  dispatchInputEvents(element: HTMLElement, value: string) {
+    const inputEvent =
+      typeof InputEvent !== 'undefined'
+        ? new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' })
+        : new Event('input', { bubbles: true });
+    element.dispatchEvent(inputEvent);
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  typeByLabel(label: string, text: string, options: { exact?: boolean } = {}) {
+    if (!label) return { success: false, error: 'Missing label query.' };
+    const inputs: Array<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement> = Array.from(
+      document.querySelectorAll('input, textarea, select'),
+    );
+    let bestElement: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null = null;
+    let bestScore = 0;
+    let bestSelector = '';
+
+    inputs.forEach((input) => {
+      if (!this.isElementVisible(input)) return;
+      const labelText = this.getElementLabel(input);
+      const score = this.scoreMatch(labelText || this.getAccessibleName(input), label, options.exact);
+      if (score > 0 && (!bestElement || score > bestScore)) {
+        bestElement = input;
+        bestScore = score;
+        bestSelector = this.getOptimalSelector(input);
+      }
+    });
+
+    if (!bestElement) return { success: false, error: 'No matching input found.' };
+    const target = bestElement as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+    target.focus();
+    this.setElementValue(target, text ?? '');
+    this.dispatchInputEvents(target, text ?? '');
+    return { success: true, selector: bestSelector };
+  }
+
+  getVisibleText(selector?: string, maxChars = 10000) {
+    const root = selector ? document.querySelector<HTMLElement>(selector) : document.body;
+    if (!root) return '';
+
     // Get all text nodes that are actually visible
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode: (node) => {
         const parent = node.parentElement;
         if (!parent) return NodeFilter.FILTER_REJECT;
@@ -278,7 +559,7 @@ class ContentScriptHandler {
       textParts.push(node.textContent?.trim() || '');
     }
 
-    return textParts.join(' ').substring(0, 10000); // Limit to 10KB
+    return textParts.join(' ').substring(0, maxChars); // Limit output size
   }
 }
 

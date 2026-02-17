@@ -17,8 +17,11 @@ import type { Message } from '../../ai/message-schema.js';
 import { createExponentialBackoff, isValidFinalResponse } from '../../ai/retry-engine.js';
 import { extractThinking } from '../../ai/message-utils.js';
 
+import { BrowserTools } from '../../tools/browser-tools.js';
 import { buildRunPlan, normalizePlanStatus, normalizePlanSteps } from '../../types/plan.js';
 import type { RunPlan } from '../../types/plan.js';
+import { buildQaSpec, pickLatestRunId } from '../../types/qa-spec.js';
+import type { QaToolEvent } from '../../types/qa-spec.js';
 import { RUNTIME_MESSAGE_SCHEMA_VERSION, isRuntimeMessage } from '../../types/runtime-messages.js';
 import type { RuntimeMessage } from '../../types/runtime-messages.js';
 
@@ -167,6 +170,150 @@ function testToolDefinitions(runner: TestRunner) {
   runner.test('Required parameters are properly marked', () => {
     const navTool = mockToolDefinitions.find((t) => t.name === 'navigate');
     runner.assertTrue(navTool?.input_schema.required?.includes('url'), 'Navigate requires url');
+  });
+}
+
+// Test BrowserTools definitions for added QA helpers
+function testBrowserToolExtensions(runner: TestRunner) {
+  log('\n=== Testing BrowserTools Extensions ===', 'info');
+
+  const browserTools = new BrowserTools();
+  const definitions = browserTools.getToolDefinitions();
+  const toolNames = definitions.map((tool) => tool.name);
+
+  const expectedTools = [
+    'getVisibleText',
+    'getElementInfo',
+    'getAllInputs',
+    'getAllButtons',
+    'highlightElement',
+    'unhighlightAll',
+    'simulateHover',
+    'findElements',
+    'clickByText',
+    'clickByRole',
+    'typeByLabel',
+    'waitForSelector',
+    'waitForText',
+    'assertVisible',
+    'assertText',
+    'assertUrl',
+    'assertValue',
+    'getDomSnapshot',
+    'screenshotElement',
+  ];
+
+  runner.test('New tool definitions are registered', () => {
+    expectedTools.forEach((name) => {
+      runner.assertTrue(toolNames.includes(name), `Missing tool: ${name}`);
+    });
+  });
+
+  runner.test('getContent exposes maxChars', () => {
+    const tool = definitions.find((t) => t.name === 'getContent');
+    runner.assertTrue(!!tool?.input_schema?.properties?.maxChars, 'getContent should include maxChars');
+  });
+
+  runner.test('clickByText requires text', () => {
+    const tool = definitions.find((t) => t.name === 'clickByText');
+    runner.assertTrue(tool?.input_schema?.required?.includes('text'), 'clickByText requires text');
+  });
+
+  runner.test('clickByRole requires role', () => {
+    const tool = definitions.find((t) => t.name === 'clickByRole');
+    runner.assertTrue(tool?.input_schema?.required?.includes('role'), 'clickByRole requires role');
+  });
+
+  runner.test('typeByLabel requires label and text', () => {
+    const tool = definitions.find((t) => t.name === 'typeByLabel');
+    runner.assertTrue(tool?.input_schema?.required?.includes('label'), 'typeByLabel requires label');
+    runner.assertTrue(tool?.input_schema?.required?.includes('text'), 'typeByLabel requires text');
+  });
+
+  runner.test('waitForSelector requires selector', () => {
+    const tool = definitions.find((t) => t.name === 'waitForSelector');
+    runner.assertTrue(tool?.input_schema?.required?.includes('selector'), 'waitForSelector requires selector');
+  });
+
+  runner.test('assertValue requires selector and value', () => {
+    const tool = definitions.find((t) => t.name === 'assertValue');
+    runner.assertTrue(tool?.input_schema?.required?.includes('selector'), 'assertValue requires selector');
+    runner.assertTrue(tool?.input_schema?.required?.includes('value'), 'assertValue requires value');
+  });
+
+  runner.test('screenshotElement requires selector', () => {
+    const tool = definitions.find((t) => t.name === 'screenshotElement');
+    runner.assertTrue(tool?.input_schema?.required?.includes('selector'), 'screenshotElement requires selector');
+  });
+
+  runner.test('BrowserTools exposes extended tool registry', () => {
+    expectedTools.forEach((name) => {
+      runner.assertTrue(browserTools.tools[name] === true, `BrowserTools.tools missing ${name}`);
+    });
+  });
+}
+
+function testQaSpecBuilder(runner: TestRunner) {
+  log('\n=== Testing QA Spec Builder ===', 'info');
+
+  const events: QaToolEvent[] = [
+    {
+      id: 'tool-1',
+      runId: 'run-a',
+      tool: 'set_plan',
+      args: {},
+      status: 'success',
+      startedAt: 10,
+    },
+    {
+      id: 'tool-2',
+      runId: 'run-a',
+      tool: 'navigate',
+      args: { url: 'https://example.com' },
+      status: 'success',
+      startedAt: 20,
+      resultSummary: 'Navigated',
+    },
+    {
+      id: 'tool-3',
+      runId: 'run-b',
+      tool: 'click',
+      args: { selector: '#cta' },
+      status: 'success',
+      startedAt: 30,
+    },
+    {
+      id: 'tool-4',
+      runId: 'run-b',
+      tool: 'assertText',
+      args: { selector: '#cta', text: 'Go' },
+      status: 'error',
+      startedAt: 40,
+    },
+  ];
+
+  runner.test('pickLatestRunId selects latest run', () => {
+    runner.assertEqual(pickLatestRunId(events), 'run-b', 'Latest run should be run-b');
+  });
+
+  runner.test('buildQaSpec filters non-replayable and failed steps by default', () => {
+    const spec = buildQaSpec(events, {
+      name: 'Test Spec',
+      sessionId: 'session-1',
+      runId: 'run-b',
+    });
+    runner.assertEqual(spec.steps.length, 1, 'Expected only successful replayable steps');
+    runner.assertEqual(spec.steps[0]?.tool, 'click', 'Expected click step');
+  });
+
+  runner.test('buildQaSpec includes failed steps when requested', () => {
+    const spec = buildQaSpec(events, {
+      name: 'Test Spec',
+      sessionId: 'session-1',
+      runId: 'run-b',
+      includeFailed: true,
+    });
+    runner.assertEqual(spec.steps.length, 2, 'Expected failed steps included');
   });
 }
 
@@ -633,6 +780,8 @@ function main() {
   const runner = new TestRunner();
 
   testToolDefinitions(runner);
+  testBrowserToolExtensions(runner);
+  testQaSpecBuilder(runner);
   testAIProviderConfig(runner);
   testToolSchemaConversion(runner);
   testInputValidation(runner);

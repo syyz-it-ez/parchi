@@ -1,5 +1,6 @@
 import type { Message } from '../../ai/message-schema.js';
 import type { RunPlan } from '../../types/plan.js';
+import type { QaToolEvent } from '../../types/qa-spec.js';
 import { AccountClient } from '../services/account-client.js';
 import { getSidePanelElements } from './panel-elements.js';
 import type { AuthState, BillingOverview, Entitlement, UsageStats } from './panel-types.js';
@@ -62,6 +63,9 @@ export class SidePanelUI {
   activeToolName: string | null;
   streamingReasoning: string;
   currentPlan: RunPlan | null;
+  qaToolEvents: QaToolEvent[];
+  qaToolEventIndex: Map<string, QaToolEvent>;
+  lastRunId: string | null;
 
   // Methods attached via prototype in panel-modules
   declare init: () => Promise<void>;
@@ -121,6 +125,9 @@ export class SidePanelUI {
     this.activeToolName = null;
     this.streamingReasoning = '';
     this.currentPlan = null;
+    this.qaToolEvents = [];
+    this.qaToolEventIndex = new Map();
+    this.lastRunId = null;
     void this.init();
   }
 }

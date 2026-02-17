@@ -21,7 +21,8 @@
     "tools/**/*.ts",
     "sidepanel/**/*.ts",
     "tests/**/*.ts",
-    "types/**/*.d.ts"
+    "types/**/*.d.ts",
+    "types/**/*.ts"
   ],
   "exclude": ["server/**", "dist/**", "node_modules/**"]
 }

@@ -19,6 +19,7 @@ import { buildToolSet, describeImageWithModel, resolveLanguageModel } from './ai
 import { BrowserTools } from './tools/browser-tools.js';
 import { buildRunPlan } from './types/plan.js';
 import type { RunPlan } from './types/plan.js';
+import type { QaSpec } from './types/qa-spec.js';
 import { RUNTIME_MESSAGE_SCHEMA_VERSION } from './types/runtime-messages.js';
 
 type RunMeta = {
@@ -94,6 +95,13 @@ class BackgroundService {
             message.sessionId || `session-${Date.now()}`,
           );
           break;
+
+        case 'run_qa_spec': {
+          const spec = message.spec as QaSpec | undefined;
+          const result = await this.runQaSpec(spec, message.sessionId || `session-${Date.now()}`);
+          sendResponse({ success: true, result });
+          break;
+        }
 
         case 'execute_tool': {
           const result = await this.browserTools.executeTool(message.tool, message.args);
@@ -519,6 +527,121 @@ class BackgroundService {
     }
   }
 
+  async runQaSpec(spec: QaSpec | undefined, sessionId: string) {
+    if (!spec || spec.schemaVersion !== 1 || !Array.isArray(spec.steps)) {
+      const error = 'Invalid QA spec payload.';
+      this.sendRuntime(
+        { runId: `qa-run-${Date.now()}`, turnId: `qa-turn-${Date.now()}`, sessionId },
+        { type: 'run_error', message: error },
+      );
+      return { success: false, error };
+    }
+
+    const runMeta: RunMeta = {
+      runId: `qa-run-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      turnId: `qa-turn-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      sessionId,
+    };
+
+    const { settings, visionProfile } = await this.loadSettingsForToolRun();
+    this.currentPlan = null;
+    this.subAgentCount = 0;
+    this.subAgentProfileCursor = 0;
+    this.lastBrowserAction = null;
+    this.awaitingVerification = false;
+    this.currentStepVerified = false;
+
+    this.sendRuntime(runMeta, { type: 'assistant_stream_start' });
+    this.sendRuntime(runMeta, {
+      type: 'assistant_stream_delta',
+      content: `Running QA spec: ${spec.name || 'QA Spec'}`,
+    });
+
+    const results: Array<{ step: number; tool: string; success: boolean; error?: string }> = [];
+    let failed = 0;
+
+    for (let i = 0; i < spec.steps.length; i += 1) {
+      const step = spec.steps[i];
+      if (!step || !step.tool) continue;
+      const stepResult: any = await this.executeToolByName(
+        step.tool,
+        step.args || {},
+        {
+          runMeta,
+          settings,
+          visionProfile,
+        },
+      );
+      const success = !(stepResult && (stepResult.error || stepResult.success === false));
+      results.push({
+        step: i + 1,
+        tool: step.tool,
+        success,
+        error: stepResult?.error,
+      });
+      if (!success) {
+        failed += 1;
+      }
+    }
+
+    const summary =
+      failed === 0
+        ? `QA spec complete: ${results.length} steps passed.`
+        : `QA spec complete: ${failed}/${results.length} steps failed.`;
+
+    this.sendRuntime(runMeta, { type: 'assistant_final', content: summary });
+
+    return { success: failed === 0, results };
+  }
+
+  async loadSettingsForToolRun() {
+    const settings = await chrome.storage.local.get([
+      'provider',
+      'apiKey',
+      'model',
+      'customEndpoint',
+      'systemPrompt',
+      'sendScreenshotsAsImages',
+      'screenshotQuality',
+      'showThinking',
+      'streamResponses',
+      'temperature',
+      'maxTokens',
+      'timeout',
+      'contextLimit',
+      'enableScreenshots',
+      'toolPermissions',
+      'allowedDomains',
+      'configs',
+      'activeConfig',
+      'visionProfile',
+      'visionBridge',
+    ]);
+
+    if (settings.enableScreenshots === undefined) settings.enableScreenshots = false;
+    if (settings.sendScreenshotsAsImages === undefined) settings.sendScreenshotsAsImages = false;
+    if (settings.visionBridge === undefined) settings.visionBridge = true;
+    if (!settings.toolPermissions) {
+      settings.toolPermissions = {
+        read: true,
+        interact: true,
+        navigate: true,
+        tabs: true,
+        screenshots: false,
+      };
+    }
+    if (settings.allowedDomains === undefined) settings.allowedDomains = '';
+
+    this.currentSettings = settings;
+
+    const activeProfileName = settings.activeConfig || 'default';
+    const visionProfileName = settings.visionProfile || null;
+    const visionProfile =
+      settings.visionBridge !== false ? this.resolveProfile(settings, visionProfileName || activeProfileName) : null;
+
+    return { settings, visionProfile };
+  }
+
   async executeToolByName(
     toolName: string,
     args: Record<string, any>,
@@ -638,7 +761,7 @@ class BackgroundService {
       return blocked;
     }
 
-    if (toolName === 'screenshot' && this.currentSettings?.enableScreenshots === false) {
+    if ((toolName === 'screenshot' || toolName === 'screenshotElement') && this.currentSettings?.enableScreenshots === false) {
       const blocked = {
         success: false,
         error: 'Screenshots are disabled in settings.',
@@ -660,19 +783,35 @@ class BackgroundService {
     }
 
     // Track state for enforcement
-    const browserActions = ['navigate', 'click', 'type', 'scroll', 'pressKey'];
+    const browserActions = ['navigate', 'click', 'clickByText', 'clickByRole', 'type', 'typeByLabel', 'scroll', 'pressKey'];
+    const verificationTools = new Set([
+      'getContent',
+      'getVisibleText',
+      'getElementInfo',
+      'getAllInputs',
+      'getAllButtons',
+      'findElements',
+      'waitForSelector',
+      'waitForText',
+      'assertVisible',
+      'assertText',
+      'assertUrl',
+      'assertValue',
+      'getDomSnapshot',
+    ]);
     if (browserActions.includes(toolName)) {
       this.lastBrowserAction = toolName;
       this.awaitingVerification = true;
       this.currentStepVerified = false;
-    } else if (toolName === 'getContent') {
+    } else if (verificationTools.has(toolName)) {
       this.awaitingVerification = false;
+      this.currentStepVerified = true;
     }
 
     const finalResult = result || { error: 'No result returned' };
 
     if (
-      toolName === 'screenshot' &&
+      (toolName === 'screenshot' || toolName === 'screenshotElement') &&
       finalResult?.success &&
       finalResult.dataUrl &&
       this.currentSettings?.visionBridge &&
@@ -828,11 +967,30 @@ class BackgroundService {
       navigate: 'navigate',
       openTab: 'navigate',
       click: 'interact',
+      clickByText: 'interact',
+      clickByRole: 'interact',
       type: 'interact',
+      typeByLabel: 'interact',
       pressKey: 'interact',
       scroll: 'interact',
       getContent: 'read',
+      getVisibleText: 'read',
+      getElementInfo: 'read',
+      getAllInputs: 'read',
+      getAllButtons: 'read',
+      findElements: 'read',
+      waitForSelector: 'read',
+      waitForText: 'read',
+      assertVisible: 'read',
+      assertText: 'read',
+      assertUrl: 'read',
+      assertValue: 'read',
+      getDomSnapshot: 'read',
+      highlightElement: 'interact',
+      unhighlightAll: 'interact',
+      simulateHover: 'interact',
       screenshot: 'screenshots',
+      screenshotElement: 'screenshots',
       getTabs: 'tabs',
       closeTab: 'tabs',
       switchTab: 'tabs',
@@ -960,7 +1118,7 @@ class BackgroundService {
 
 REQUIRED NEXT CALL: ${requiredNextCall}
 
-You CANNOT call navigate, click, type, scroll, or pressKey until you call set_plan.
+You CANNOT call navigate, click, clickByText, clickByRole, type, typeByLabel, scroll, or pressKey until you call set_plan.
 Create 3-6 specific action steps, then proceed.
 </execution_state>`;
     } else {
@@ -980,11 +1138,11 @@ Create 3-6 specific action steps, then proceed.
 ✅ ALL STEPS COMPLETE (${doneCount}/${steps.length})
 ${planLines.join('\n')}
 
-REQUIRED: Provide your final summary now with evidence from getContent.
+REQUIRED: Provide your final summary now with evidence from verification tools (getContent, getVisibleText, assert*).
 </execution_state>`;
       } else if (this.awaitingVerification) {
         // Browser action taken but getContent not called yet
-        requiredNextCall = 'getContent({ mode: "text" })';
+        requiredNextCall = 'getContent({ mode: "text" }) or assertVisible({ selector: "..." })';
         stateSection = `
 <execution_state>
 PROGRESS: ${doneCount}/${steps.length} steps complete
@@ -992,12 +1150,12 @@ ${planLines.join('\n')}
 
 CURRENT STEP: "${steps[currentIndex].title}"
 LAST ACTION: ${this.lastBrowserAction || 'unknown'}
-VERIFICATION: ⚠️ PENDING - getContent NOT called
+VERIFICATION: ⚠️ PENDING - no verification tool called
 
 ⛔ REQUIRED NEXT CALL: ${requiredNextCall}
 
-You MUST call getContent to verify your action before proceeding.
-Do NOT call update_plan or any other tool until you call getContent.
+You MUST call a verification tool (getContent, getVisibleText, assert*, wait*) before proceeding.
+Do NOT call update_plan or any other tool until you verify the state.
 </execution_state>`;
       } else {
         // Ready to mark step done or execute next action
@@ -1008,7 +1166,7 @@ PROGRESS: ${doneCount}/${steps.length} steps complete
 ${planLines.join('\n')}
 
 CURRENT STEP: "${steps[currentIndex].title}"
-VERIFICATION: ✓ getContent was called
+VERIFICATION: ✓ verification tool was called
 
 ⚠️ REQUIRED NEXT CALL: ${requiredNextCall}
 
@@ -1080,7 +1238,7 @@ Before your next tool call, verify:
   ) {
     let tools = this.browserTools.getToolDefinitions();
     if (settings && settings.enableScreenshots === false) {
-      tools = tools.filter((tool) => tool.name !== 'screenshot');
+      tools = tools.filter((tool) => tool.name !== 'screenshot' && tool.name !== 'screenshotElement');
     }
     tools = tools.concat([
       {

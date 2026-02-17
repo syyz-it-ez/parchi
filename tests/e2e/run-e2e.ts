@@ -40,6 +40,8 @@ const headless = process.env.E2E_HEADLESS === 'true';
 if (headless) {
   log('Extensions are not supported in headless mode; tests may fail.', 'warning');
 }
+const runtimeSchemaVersion = 2;
+const sessionId = `session-e2e-${Date.now()}`;
 
 type TestContext = {
   panel: import('playwright').Page;
@@ -72,12 +74,22 @@ async function seedAccessState(worker: import('playwright').Worker): Promise<voi
         plan: 'pro',
         renewsAt: '',
       },
+      showThinking: true,
+      saveHistory: true,
     });
   });
 }
 
 async function sendRuntimeMessage(worker: import('playwright').Worker, message: Record<string, unknown>) {
-  await worker.evaluate((payload) => chrome.runtime.sendMessage(payload), message);
+  const payload: Record<string, any> = {
+    schemaVersion: runtimeSchemaVersion,
+    sessionId,
+    ...message,
+  };
+  if (payload.timestamp === undefined) {
+    payload.timestamp = Date.now();
+  }
+  await worker.evaluate((data) => chrome.runtime.sendMessage(data), payload);
 }
 
 test('Side panel loads and shows ready state', async ({ panel }) => {
@@ -96,8 +108,11 @@ test('Settings panel toggles custom endpoint field', async ({ panel }) => {
   await panel.waitForSelector('#settingsPanel', { state: 'visible', timeout: timeoutMs });
   await panel.selectOption('#provider', 'custom');
   await panel.waitForSelector('#customEndpointGroup', { state: 'visible', timeout: timeoutMs });
-  await panel.click('#settingsBtn');
-  await panel.waitForSelector('#chatInterface', { state: 'visible', timeout: timeoutMs });
+  await panel.click('#navChatBtn');
+  await panel.waitForFunction(() => {
+    const panelEl = document.querySelector('#settingsPanel');
+    return panelEl && panelEl.classList.contains('hidden');
+  }, { timeout: timeoutMs });
 });
 
 test('Tab selector lists integration test page', async ({ panel, context }) => {
@@ -116,7 +131,7 @@ test('Tab selector lists integration test page', async ({ panel, context }) => {
   );
 });
 
-test('Run UI renders plan, tool events, and retry controls', async ({ panel, worker }) => {
+test('Plan drawer renders and tool events stream', async ({ panel, worker }) => {
   const runId = `run-e2e-${Date.now()}`;
   const now = Date.now();
   const plan = {
@@ -130,37 +145,29 @@ test('Run UI renders plan, tool events, and retry controls', async ({ panel, wor
 
   await sendRuntimeMessage(worker, {
     type: 'plan_update',
-    schemaVersion: 1,
     runId,
     timestamp: now,
     plan,
   });
 
-  await panel.waitForSelector(`.run-container[data-run-id="${runId}"]`, { timeout: timeoutMs });
-  await panel.click(`.run-container[data-run-id="${runId}"] .run-plan-toggle`);
-  await panel.waitForSelector(`.run-container[data-run-id="${runId}"] .run-plan-step`, {
-    state: 'visible',
-    timeout: timeoutMs,
-  });
+  await panel.waitForFunction(() => {
+    const drawer = document.querySelector('#planDrawer');
+    return drawer && !drawer.classList.contains('hidden');
+  }, { timeout: timeoutMs });
+  await panel.waitForSelector('#planChecklist .plan-checklist-item', { timeout: timeoutMs });
+
+  const stepCount = await panel.$eval('#planStepCount', (el) => el.textContent || '');
+  assert(stepCount.includes('0/2'), 'Expected plan step count to reflect progress.');
 
   await sendRuntimeMessage(worker, {
-    type: 'run_status',
-    schemaVersion: 1,
+    type: 'assistant_stream_start',
     runId,
     timestamp: now + 1,
-    phase: 'executing',
-    attempts: { api: 0, tool: 0, finalize: 0 },
-    maxRetries: { api: 1, tool: 1, finalize: 1 },
-    note: 'Executing',
   });
-  await panel.waitForSelector(`.run-container[data-run-id="${runId}"] .run-status-stop`, {
-    state: 'visible',
-    timeout: timeoutMs,
-  });
+  await panel.waitForSelector('.message.assistant.streaming', { state: 'attached', timeout: timeoutMs });
 
   await sendRuntimeMessage(worker, {
     type: 'tool_execution_start',
-    schemaVersion: 1,
     runId,
     timestamp: now + 2,
     tool: 'navigate',
@@ -168,9 +175,10 @@ test('Run UI renders plan, tool events, and retry controls', async ({ panel, wor
     args: { url: 'https://example.com' },
   });
 
+  await panel.waitForSelector('.stream-events .tool-tree-item', { timeout: timeoutMs });
+
   await sendRuntimeMessage(worker, {
     type: 'tool_execution_result',
-    schemaVersion: 1,
     runId,
     timestamp: now + 3,
     tool: 'navigate',
@@ -179,75 +187,54 @@ test('Run UI renders plan, tool events, and retry controls', async ({ panel, wor
     result: { success: true, message: 'Navigated' },
   });
 
-  await panel.waitForSelector(`.run-container[data-run-id="${runId}"] details.tool-event.success`, {
-    state: 'attached',
-    timeout: timeoutMs,
-  });
+  await panel.waitForSelector('.stream-events .tool-tree-item.success', { timeout: timeoutMs });
 
   await sendRuntimeMessage(worker, {
-    type: 'run_status',
-    schemaVersion: 1,
+    type: 'assistant_final',
     runId,
     timestamp: now + 4,
-    phase: 'failed',
-    attempts: { api: 1, tool: 0, finalize: 0 },
-    maxRetries: { api: 1, tool: 1, finalize: 1 },
-    lastError: 'Test failure',
-  });
-  await panel.waitForSelector(`.run-container[data-run-id="${runId}"] .run-status-retry`, {
-    state: 'visible',
-    timeout: timeoutMs,
+    content: 'Plan run complete.',
   });
 });
 
-test('History restores run cards with filters', async ({ panel, worker }) => {
+test('History shows sessions and QA actions', async ({ panel, worker }) => {
   const now = Date.now();
   const session = {
     id: `session-e2e-${now}`,
     startedAt: now,
     updatedAt: now,
     title: 'History Session',
-    runs: [
+    messageCount: 2,
+    transcript: [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Done' },
+    ],
+    toolEvents: [
       {
+        id: 'tool-1',
         runId: 'run-history-1',
+        tool: 'navigate',
+        args: { url: 'https://example.com' },
+        status: 'success',
         startedAt: now,
-        updatedAt: now,
-        goal: 'Check docs',
-        plan: {
-          steps: [{ id: 'step-1', title: 'Collect info', status: 'done' }],
-          createdAt: now,
-          updatedAt: now,
-        },
-        notes: '',
-        toolEvents: [
-          {
-            id: 'tool-1',
-            toolName: 'getContent',
-            argsText: '{"type":"text"}',
-            status: 'success',
-            startedAt: now,
-            category: 'extraction',
-            resultText: '{"success":true}',
-          },
-        ],
-        toolFilter: 'all',
-        screenshots: [],
-        retryEvents: [],
-        subagents: [],
-        finalResponse: 'Done',
-        status: 'completed',
-        statusNote: '',
-        statusError: '',
+        endedAt: now + 1,
+        resultSummary: 'Navigated',
       },
     ],
-    transcript: [],
+    lastRunId: 'run-history-1',
   };
 
   await worker.evaluate((payload) => chrome.storage.local.set({ chatSessions: payload }), [session]);
-  await panel.click('#viewHistoryBtn');
-  await panel.waitForSelector('.history-item', { timeout: timeoutMs });
-  await panel.click('.history-item');
-  await panel.waitForSelector('.history-runs .run-tool-filters', { timeout: timeoutMs });
+  await panel.waitForFunction(() => Boolean((window as any).sidePanelUI?.loadHistoryList), { timeout: timeoutMs });
+  await panel.evaluate(() => {
+    (window as any).sidePanelUI.loadHistoryList();
+  });
+  await panel.waitForSelector('.history-item', { state: 'attached', timeout: timeoutMs });
+
+  const exportDisabled = await panel.$eval('.history-export', (el) => (el as HTMLButtonElement).disabled);
+  const replayDisabled = await panel.$eval('.history-replay', (el) => (el as HTMLButtonElement).disabled);
+  assert(exportDisabled === false, 'Export action should be enabled');
+  assert(replayDisabled === false, 'Replay action should be enabled');
 });
 
 test('Chat displays streaming message during assistant response', async ({ panel, worker }) => {
@@ -257,7 +244,6 @@ test('Chat displays streaming message during assistant response', async ({ panel
   // Send stream start
   await sendRuntimeMessage(worker, {
     type: 'assistant_stream_start',
-    schemaVersion: 1,
     runId,
     timestamp: now,
   });
@@ -268,127 +254,63 @@ test('Chat displays streaming message during assistant response', async ({ panel
   // Send stream delta with content
   await sendRuntimeMessage(worker, {
     type: 'assistant_stream_delta',
-    schemaVersion: 1,
     runId,
     timestamp: now + 1,
     content: 'Hello, I am responding',
   });
 
-  // Verify streamed content exists in DOM
   await panel.waitForFunction(
     () => {
-      const el = document.querySelector('.streaming-text');
-      return el && el.textContent && el.textContent.includes('Hello');
+      return (window as any).sidePanelUI?.streamingState?.textBuffer?.includes('Hello');
     },
     { timeout: timeoutMs },
   );
+
+  await sendRuntimeMessage(worker, {
+    type: 'assistant_final',
+    runId,
+    timestamp: now + 2,
+    content: 'Done',
+  });
 });
 
 test('Thinking block is collapsed by default and expandable', async ({ panel, worker }) => {
   const runId = `run-thinking-${Date.now()}`;
   const now = Date.now();
 
+  await panel.evaluate(() => {
+    (window as any).sidePanelUI?.finishStreamingMessage?.();
+  });
+
   // Send final message with thinking
   await sendRuntimeMessage(worker, {
     type: 'assistant_final',
-    schemaVersion: 1,
     runId,
     timestamp: now,
     content: 'Here is my response.',
     thinking: 'Let me think about this carefully...',
   });
 
-  // Wait for this specific run's thinking section to be collapsed
-  const runSelector = `.run-container[data-run-id="${runId}"]`;
-  await panel.waitForFunction(
-    (selector) => {
-      const run = document.querySelector(selector);
-      if (!run) return false;
-      const details = run.querySelector('.run-thinking-details:not(.hidden)') as HTMLDetailsElement;
-      return details && !details.open;
-    },
-    runSelector,
-    { timeout: timeoutMs },
-  );
+  await panel.waitForFunction(() => {
+    const messages = Array.from(document.querySelectorAll('.message.assistant'));
+    const last = messages[messages.length - 1] as HTMLElement | undefined;
+    const block = last?.querySelector('.thinking-block') as HTMLElement | null;
+    return block && block.classList.contains('collapsed');
+  }, { timeout: timeoutMs });
 
-  // Click to expand using the summary element within this run
-  // Use evaluate to click directly as the element may be in a non-visible container
-  await panel.evaluate((selector) => {
-    const run = document.querySelector(selector);
-    const summary = run?.querySelector('.run-thinking-summary') as HTMLElement;
-    summary?.click();
-  }, runSelector);
-
-  // Verify thinking details is now expanded
-  await panel.waitForFunction(
-    (selector) => {
-      const run = document.querySelector(selector);
-      if (!run) return false;
-      const details = run.querySelector('.run-thinking-details') as HTMLDetailsElement;
-      return details && details.open;
-    },
-    runSelector,
-    { timeout: timeoutMs },
-  );
-});
-
-test('Tool calls appear in collapsible Tools section', async ({ panel, worker }) => {
-  const runId = `run-tool-section-${Date.now()}`;
-  const now = Date.now();
-
-  // Send tool execution start
-  await sendRuntimeMessage(worker, {
-    type: 'tool_execution_start',
-    schemaVersion: 1,
-    runId,
-    timestamp: now,
-    tool: 'navigate',
-    id: 'tool-section-1',
-    args: { url: 'https://example.com' },
+  await panel.evaluate(() => {
+    const messages = Array.from(document.querySelectorAll('.message.assistant'));
+    const last = messages[messages.length - 1] as HTMLElement | undefined;
+    const header = last?.querySelector('.thinking-header') as HTMLElement | null;
+    header?.click();
   });
 
-  // Verify tool appears in the collapsible Tools section
-  await panel.waitForSelector(`.run-container[data-run-id="${runId}"] .run-tools-details`, {
-    state: 'attached',
-    timeout: timeoutMs,
-  });
-
-  // Verify Tools section is visible (not hidden) after tool execution
-  await panel.waitForFunction(
-    (selector) => {
-      const run = document.querySelector(selector);
-      if (!run) return false;
-      const toolsSection = run.querySelector('.run-tools-details');
-      return toolsSection && !toolsSection.classList.contains('hidden');
-    },
-    `.run-container[data-run-id="${runId}"]`,
-    { timeout: timeoutMs },
-  );
-
-  // Verify tool count shows 1
-  const toolCount = await panel.$eval(
-    `.run-container[data-run-id="${runId}"] .run-tools-count`,
-    (el) => el.textContent,
-  );
-  assert(toolCount === '1', 'Tool count should be 1');
-
-  // Send tool result
-  await sendRuntimeMessage(worker, {
-    type: 'tool_execution_result',
-    schemaVersion: 1,
-    runId,
-    timestamp: now + 1,
-    tool: 'navigate',
-    id: 'tool-section-1',
-    args: { url: 'https://example.com' },
-    result: { success: true },
-  });
-
-  // Verify tool shows success status
-  await panel.waitForSelector(`.run-container[data-run-id="${runId}"] details.tool-event.success`, {
-    state: 'attached',
-    timeout: timeoutMs,
-  });
+  await panel.waitForFunction(() => {
+    const messages = Array.from(document.querySelectorAll('.message.assistant'));
+    const last = messages[messages.length - 1] as HTMLElement | undefined;
+    const block = last?.querySelector('.thinking-block') as HTMLElement | null;
+    return block && !block.classList.contains('collapsed');
+  }, { timeout: timeoutMs });
 });
 
 test('Color scheme uses neutral grays', async ({ panel }) => {

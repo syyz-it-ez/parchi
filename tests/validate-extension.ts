@@ -262,12 +262,20 @@ class ExtensionValidator {
       const toolsPath = this.fileExists('tools/browser-tools.js');
       const content = fs.readFileSync(toolsPath, 'utf8');
 
-      if (!content.includes('export class BrowserTools')) {
-        throw new Error('BrowserTools class not exported');
+      if (!/class\s+BrowserTools\b/.test(content) && !/BrowserTools\s*=\s*class\b/.test(content)) {
+        throw new Error('BrowserTools class not found');
       }
 
-      if (!content.includes('getToolDefinitions')) {
+      if (!/getToolDefinitions\s*\(/.test(content)) {
         throw new Error('getToolDefinitions method not found');
+      }
+
+      const hasExport =
+        /export\s+class\s+BrowserTools\b/.test(content) ||
+        /export\s*{\s*BrowserTools\s*}/.test(content) ||
+        /exports\.BrowserTools/.test(content);
+      if (!hasExport) {
+        throw new Error('BrowserTools class not exported');
       }
     });
   }

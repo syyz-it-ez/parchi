@@ -1,5 +1,6 @@
-import { normalizeConversationHistory } from '../../ai/message-schema.js';
+import { createMessage, normalizeConversationHistory } from '../../ai/message-schema.js';
 import { dedupeThinking, extractThinking } from '../../ai/message-utils.js';
+import { buildQaSpec } from '../../types/qa-spec.js';
 import { SidePanelUI } from './panel-ui.js';
 
 (SidePanelUI.prototype as any).persistHistory = async function persistHistory() {
@@ -17,6 +18,8 @@ import { SidePanelUI } from './panel-ui.js';
     title: this.firstUserMessage || 'Session',
     messageCount: this.displayHistory.length,
     transcript: this.displayHistory.slice(-200),
+    toolEvents: Array.isArray(this.qaToolEvents) ? this.qaToolEvents.slice(-500) : [],
+    lastRunId: this.lastRunId || undefined,
   };
   
   try {
@@ -57,6 +60,7 @@ import { SidePanelUI } from './panel-ui.js';
       const date = new Date(session.updatedAt || session.startedAt || Date.now());
       const msgCount = session.messageCount || session.transcript?.length || 0;
       const timeAgo = this.formatTimeAgo(date);
+      const hasToolEvents = Array.isArray(session.toolEvents) && session.toolEvents.length > 0;
       
       item.innerHTML = `
         <div class="history-item-main">
@@ -67,17 +71,41 @@ import { SidePanelUI } from './panel-ui.js';
             <span>${msgCount} messages</span>
           </div>
         </div>
-        <button class="history-delete" title="Delete" data-session-id="${session.id}">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
-          </svg>
-        </button>
+        <div class="history-actions">
+          <button class="history-action history-export" title="Export QA Spec" ${hasToolEvents ? '' : 'disabled'}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 3v12"></path>
+              <polyline points="8 11 12 15 16 11"></polyline>
+              <path d="M20 21H4"></path>
+            </svg>
+          </button>
+          <button class="history-action history-replay" title="Replay QA Spec" ${hasToolEvents ? '' : 'disabled'}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+          </button>
+          <button class="history-delete" title="Delete" data-session-id="${session.id}">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
       `;
       
       // Click to load session
       item.querySelector('.history-item-main')?.addEventListener('click', () => {
         this.loadSession(session);
+      });
+
+      item.querySelector('.history-export')?.addEventListener('click', (e: Event) => {
+        e.stopPropagation();
+        this.exportQaSpecForSession(session);
+      });
+
+      item.querySelector('.history-replay')?.addEventListener('click', (e: Event) => {
+        e.stopPropagation();
+        this.replayQaSpecForSession(session);
       });
       
       // Delete button
@@ -94,6 +122,79 @@ import { SidePanelUI } from './panel-ui.js';
   }
 };
 
+(SidePanelUI.prototype as any).exportQaSpecForSession = function exportQaSpecForSession(session: any) {
+  try {
+    const toolEvents = Array.isArray(session?.toolEvents) ? session.toolEvents : [];
+    if (!toolEvents.length) {
+      this.updateStatus('No tool events captured for this session.', 'warning');
+      return;
+    }
+    const spec = buildQaSpec(toolEvents, {
+      name: session.title ? `${session.title} QA Spec` : 'QA Spec',
+      sessionId: session.id,
+      runId: session.lastRunId || undefined,
+    });
+    if (!spec.steps.length) {
+      this.updateStatus('No replayable steps found for this session.', 'warning');
+      return;
+    }
+    const blob = new Blob([JSON.stringify(spec, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    const safeName = (spec.name || 'qa-spec').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    anchor.download = `parchi-${safeName}-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    this.updateStatus('QA spec exported', 'success');
+  } catch (error) {
+    console.error('Failed to export QA spec:', error);
+    this.updateStatus('Unable to export QA spec', 'error');
+  }
+};
+
+(SidePanelUI.prototype as any).replayQaSpecForSession = function replayQaSpecForSession(session: any) {
+  const toolEvents = Array.isArray(session?.toolEvents) ? session.toolEvents : [];
+  if (!toolEvents.length) {
+    this.updateStatus('No tool events captured for this session.', 'warning');
+    return;
+  }
+
+  const spec = buildQaSpec(toolEvents, {
+    name: session.title ? `${session.title} QA Spec` : 'QA Spec',
+    sessionId: session.id,
+    runId: session.lastRunId || undefined,
+  });
+
+  if (!spec.steps.length) {
+    this.updateStatus('No replayable steps found for this session.', 'warning');
+    return;
+  }
+
+  if (!this.isAccessReady()) {
+    this.updateAccessUI();
+    this.updateStatus('Sign in required to replay QA spec', 'warning');
+    return;
+  }
+
+  this.startNewSession();
+  const label = `Replay QA spec: ${spec.name}`;
+  this.displayUserMessage(label);
+  const displayEntry = createMessage({ role: 'user', content: label });
+  if (displayEntry) {
+    this.displayHistory.push(displayEntry);
+    this.contextHistory.push(displayEntry);
+  }
+  this.firstUserMessage = this.firstUserMessage || label;
+
+  chrome.runtime.sendMessage({
+    type: 'run_qa_spec',
+    spec,
+    sessionId: this.sessionId,
+  });
+  this.updateStatus('Running QA spec...', 'active');
+};
+
 (SidePanelUI.prototype as any).loadSession = function loadSession(session: any) {
   this.switchView('chat');
   if (Array.isArray(session.transcript)) {
@@ -103,6 +204,15 @@ import { SidePanelUI } from './panel-ui.js';
     this.contextHistory = normalized;
     this.sessionId = session.id || `session-${Date.now()}`;
     this.firstUserMessage = session.title || '';
+    if (Array.isArray(session.toolEvents)) {
+      this.qaToolEvents = session.toolEvents;
+      this.qaToolEventIndex = new Map();
+      session.toolEvents.forEach((event: any) => {
+        if (event?.id) {
+          this.qaToolEventIndex.set(event.id, event);
+        }
+      });
+    }
     this.renderConversationHistory();
     this.updateContextUsage();
   }

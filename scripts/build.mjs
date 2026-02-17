@@ -72,6 +72,19 @@ const run = async () => {
     logLevel: 'info',
   });
 
+  // Build tools as standalone module for validation tooling
+  await esbuild.build({
+    entryPoints: [path.join(rootDir, 'tools', 'browser-tools.ts')],
+    outdir: distDir,
+    outbase: rootDir,
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    target: 'es2022',
+    sourcemap: true,
+    logLevel: 'info',
+  });
+
   await esbuild.build({
     entryPoints: [
       path.join(rootDir, 'tests', 'run-tests.ts'),
@@ -87,7 +100,12 @@ const run = async () => {
     target: 'es2022',
     sourcemap: true,
     logLevel: 'info',
-    external: ['chromium-bidi/lib/cjs/bidiMapper/BidiMapper', 'chromium-bidi/lib/cjs/cdp/CdpConnection'],
+    external: [
+      'chromium-bidi/lib/cjs/bidiMapper/BidiMapper',
+      'chromium-bidi/lib/cjs/cdp/CdpConnection',
+      'playwright',
+      'playwright-core',
+    ],
   });
 
   const manifestPath = path.join(rootDir, 'manifest.json');
@@ -100,6 +118,8 @@ const run = async () => {
   copyDirFiltered(path.join(rootDir, 'sidepanel', 'styles'), path.join(distDir, 'sidepanel', 'styles'));
   copyDirFiltered(path.join(rootDir, 'sidepanel', 'templates'), path.join(distDir, 'sidepanel', 'templates'));
   copyDirFiltered(path.join(rootDir, 'icons'), path.join(distDir, 'icons'));
+  ensureDir(path.join(distDir, 'ai'));
+  ensureDir(path.join(distDir, 'tools'));
 
   copyDirFiltered(path.join(rootDir, 'server', 'public'), path.join(serverDistDir, 'public'), (srcPath) => {
     return !srcPath.endsWith('.ts');
